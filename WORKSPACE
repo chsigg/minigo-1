@@ -14,10 +14,9 @@ http_archive(
 
 http_archive(
     name = "org_tensorflow",
-    patches = ["//cc/tensorflow:tensorflow.patch"],
-    sha256 = "dfee0f57366a6fab16a103d3a6d190c327f01f9a12651e45a128051eaf612f20",
-    strip_prefix = "tensorflow-1.11.0",
-    urls = ["https://github.com/tensorflow/tensorflow/archive/v1.11.0.zip"],
+    sha256 = "107638516b0224d3184253db21a8e938d3ee619eb1ee2667cae6890c9ab101d0",
+    strip_prefix = "tensorflow-1.12.0",
+    urls = ["https://github.com/tensorflow/tensorflow/archive/v1.12.0.zip"],
 )
 
 load("//:workspace.bzl", "minigo_workspace")
