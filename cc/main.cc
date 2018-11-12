@@ -13,7 +13,10 @@
 // limitations under the License.
 
 #include <stdio.h>
+#include <sys/prctl.h>
 #include <unistd.h>
+#include <wordexp.h>
+#include <csignal>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -112,10 +115,16 @@ DEFINE_string(model, "",
               "Path to a minigo model. The format of the model depends on the "
               "inferece engine. For engine=tf, the model should be a GraphDef "
               "proto. For engine=lite, the model should be .tflite "
-              "flatbuffer.");
+              "flatbuffer. For engine=trt, the model should be a .uff graph.");
 DEFINE_string(model_two, "",
               "When running 'eval' mode, provide a path to a second minigo "
-              "model, also serialized as a GraphDef proto.");
+              "model, also serialized as a GraphDef proto. Exactly one of "
+              "model_two and gtp_client needs to be specified in eval mode.");
+DEFINE_string(gtp_client, "",
+              "When running 'eval' mode, provide a path and arguments to an "
+              "executable which accepts GTP commands on stdin. Example: "
+              "'/usr/games/gnugo --mode gtp'. Exactly one of model_two and "
+              "gtp_client needs to be specified in eval mode.");
 DEFINE_int32(parallel_games, 32, "Number of games to play in parallel.");
 
 // Output flags.
@@ -188,12 +197,13 @@ std::string FormatInferenceInfo(
 }
 
 void WriteSgf(const std::string& output_dir, const std::string& output_name,
-              const MctsPlayer& player_b, const MctsPlayer& player_w,
+              const MctsPlayer& player_b, const std::string& name_b,
+              const MctsPlayer& player_w, const std::string& name_w,
               bool write_comments) {
   MG_CHECK(file::RecursivelyCreateDir(output_dir));
   MG_CHECK(player_b.history().size() == player_w.history().size());
 
-  bool log_names = player_b.name() != player_w.name();
+  bool log_names = name_b != name_w;
 
   std::vector<sgf::MoveWithComment> moves;
   moves.reserve(player_b.history().size());
@@ -209,8 +219,7 @@ void WriteSgf(const std::string& output_dir, const std::string& output_name,
             h.comment);
       } else {
         if (log_names) {
-          comment = absl::StrCat(i % 2 == 0 ? player_b.name() : player_w.name(),
-                                 "\n", h.comment);
+          comment = absl::StrCat(i % 2 == 0 ? name_b : name_w, "\n", h.comment);
         } else {
           comment = h.comment;
         }
@@ -221,12 +230,11 @@ void WriteSgf(const std::string& output_dir, const std::string& output_name,
     }
   }
 
-  std::string player_name(file::Basename(FLAGS_model));
   sgf::CreateSgfOptions options;
   options.komi = player_b.options().komi;
   options.result = player_b.result_string();
-  options.black_name = player_b.name();
-  options.white_name = player_w.name();
+  options.black_name = name_b;
+  options.white_name = name_w;
   options.game_comment = absl::StrCat(
       "B inferences: ", FormatInferenceInfo(player_b.inferences()), "\n",
       "W inferences: ", FormatInferenceInfo(player_w.inferences()));
@@ -238,8 +246,49 @@ void WriteSgf(const std::string& output_dir, const std::string& output_name,
 }
 
 void WriteSgf(const std::string& output_dir, const std::string& output_name,
+              const MctsPlayer& player_b, const MctsPlayer& player_w,
+              bool write_comments) {
+  WriteSgf(output_dir, output_name, player_b, player_b.name(), player_w,
+           player_w.name(), write_comments);
+}
+
+void WriteSgf(const std::string& output_dir, const std::string& output_name,
               const MctsPlayer& player, bool write_comments) {
   WriteSgf(output_dir, output_name, player, player, write_comments);
+}
+
+struct EvalResults {
+  EvalResults(absl::string_view _name)
+      : name(_name), black_wins(0), white_wins(0) {}
+  std::string name;
+  std::atomic<int> black_wins;
+  std::atomic<int> white_wins;
+};
+
+void LogEvalResults(int num_games, const EvalResults& results_a,
+                    const EvalResults& results_b) {
+  auto name_length = std::max(results_a.name.size(), results_b.name.size());
+  auto format_name = [&](const std::string& name) {
+    return absl::StrFormat("%-*s", name_length, name);
+  };
+  auto format_wins = [&](int wins) {
+    return absl::StrFormat(" %5d %6.2f%%", wins, wins * 100.0f / num_games);
+  };
+  auto print_result = [&](const EvalResults& results) {
+    std::cerr << format_name(results.name)
+              << format_wins(results.black_wins + results.white_wins)
+              << format_wins(results.black_wins)
+              << format_wins(results.white_wins) << std::endl;
+  };
+
+  std::cerr << format_name("Wins")
+            << "        Total         Black         White" << std::endl;
+  print_result(results_a);
+  print_result(results_b);
+  std::cerr << format_name("") << "              "
+            << format_wins(results_a.black_wins + results_b.black_wins)
+            << format_wins(results_a.white_wins + results_b.white_wins);
+  std::cerr << std::endl;
 }
 
 void ParseMctsPlayerOptionsFromFlags(MctsPlayer::Options* options) {
@@ -480,7 +529,7 @@ class SelfPlayer {
   uint64_t flags_timestamp_ = 0;
 };
 
-class Evaluator {
+class PairEvaluator {
   // A barrier that blocks threads until the number of waiting threads reaches
   // the 'count' threshold. This implementation has different semantics than
   // absl::Barrier: it can be reused and allows decrementing the threshold to
@@ -543,14 +592,10 @@ class Evaluator {
 
   struct Model {
     Model(const std::string& model_path)
-        : name(file::Stem(model_path)),
-          factory(NewDualNetFactory(model_path, FLAGS_parallel_games)),
-          black_wins(0),
-          white_wins(0) {}
-    std::string name;
+        : factory(NewDualNetFactory(model_path, FLAGS_parallel_games)),
+          results(file::Stem(model_path)) {}
     std::unique_ptr<DualNetFactory> factory;
-    std::atomic<int> black_wins;
-    std::atomic<int> white_wins;
+    EvalResults results;
   };
 
  public:
@@ -575,9 +620,9 @@ class Evaluator {
 
     for (int thread_id = 0; thread_id < num_games; ++thread_id) {
       bool swap_models = (thread_id & 1) != 0;
-      threads_.emplace_back(std::bind(&Evaluator::ThreadRun, this, thread_id,
-                                      cur_model.get(), prev_model.get(),
-                                      swap_models));
+      threads_.emplace_back(std::bind(&PairEvaluator::ThreadRun, this,
+                                      thread_id, cur_model.get(),
+                                      prev_model.get(), swap_models));
     }
 
     for (auto& t : threads_) {
@@ -588,29 +633,7 @@ class Evaluator {
               << absl::ToDoubleSeconds(absl::Now() - start_time) << " sec."
               << std::endl;
 
-    auto name_length =
-        std::max(prev_model->name.size(), cur_model->name.size());
-    auto format_name = [&](const std::string& name) {
-      return absl::StrFormat("%-*s", name_length, name);
-    };
-    auto format_wins = [&](int wins) {
-      return absl::StrFormat(" %5d %6.2f%%", wins, wins * 100.0f / num_games);
-    };
-    auto print_result = [&](const Model& model) {
-      std::cerr << format_name(model.name)
-                << format_wins(model.black_wins + model.white_wins)
-                << format_wins(model.black_wins)
-                << format_wins(model.white_wins) << std::endl;
-    };
-
-    std::cerr << format_name("Wins")
-              << "        Total         Black         White" << std::endl;
-    print_result(*prev_model);
-    print_result(*cur_model);
-    std::cerr << format_name("") << "              "
-              << format_wins(prev_model->black_wins + cur_model->black_wins)
-              << format_wins(prev_model->white_wins + cur_model->white_wins);
-    std::cerr << std::endl;
+    LogEvalResults(num_games, prev_model->results, cur_model->results);
   }
 
  private:
@@ -635,12 +658,12 @@ class Evaluator {
     }
 
     player_options.verbose = thread_id == 0;
-    player_options.name = model->name;
+    player_options.name = model->results.name;
     auto player = absl::make_unique<MctsPlayer>(
         absl::make_unique<WrappedDualNet>(&dual_net), player_options);
 
     player_options.verbose = false;
-    player_options.name = other_model->name;
+    player_options.name = other_model->results.name;
     auto other_player = absl::make_unique<MctsPlayer>(
         absl::make_unique<WrappedDualNet>(&dual_net), player_options);
 
@@ -679,10 +702,10 @@ class Evaluator {
 
     MG_CHECK(player->result() == other_player->result());
     if (player->result() > 0) {
-      ++model->black_wins;
+      ++model->results.black_wins;
     }
     if (player->result() < 0) {
-      ++other_model->white_wins;
+      ++other_model->results.white_wins;
     }
 
     if (black->options().verbose) {
@@ -706,14 +729,220 @@ class Evaluator {
   std::vector<std::thread> threads_;
 };
 
+class GtpEvaluator {
+  class GtpClient {
+   public:
+    GtpClient(char* const cmd_args[], float komi) : color_(Color::kBlack) {
+      int in_pipe[2];   // minigo <- gnugo pipe
+      int out_pipe[2];  // minigo -> gnugo pipe
+
+      MG_CHECK(pipe(in_pipe) == 0);
+      MG_CHECK(pipe(out_pipe) == 0);
+
+      if (auto pid = fork()) {
+        MG_CHECK(pid > 0);
+      } else {
+        MG_CHECK(close(in_pipe[0]) == 0);
+        MG_CHECK(close(out_pipe[1]) == 0);
+
+        MG_CHECK(dup2(in_pipe[1], STDOUT_FILENO) >= 0);
+        MG_CHECK(dup2(out_pipe[0], STDIN_FILENO) >= 0);
+
+        MG_CHECK(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
+        MG_CHECK(execvp(cmd_args[0], cmd_args) == 0);
+
+        exit(0);
+      }
+
+      MG_CHECK(close(in_pipe[1]) == 0);
+      MG_CHECK(close(out_pipe[0]) == 0);
+
+      input_ = fdopen(in_pipe[0], "r");
+      output_ = fdopen(out_pipe[1], "w");
+      MG_CHECK(input_ && output_);
+
+      MG_CHECK(Send(absl::StrFormat("boardsize %d", kN)));
+      MG_CHECK(Send("komi " + std::to_string(komi)));
+    }
+
+    ~GtpClient() {
+      fclose(input_);
+      fclose(output_);
+    }
+
+    bool Play(const Coord& move) {
+      std::ostringstream oss;
+      oss << "play " << color_ << " " << move.ToKgs();
+      bool success = Send(oss.str()).has_value();
+      if (success) {
+        color_ = OtherColor(color_);
+      }
+      return success;
+    }
+
+    Coord GenMove() {
+      std::ostringstream oss;
+      oss << "genmove " << color_;
+      auto move = Coord::kInvalid;
+      if (auto response = Send(oss.str())) {
+        move = Coord::FromKgs(response.value(), true);
+      }
+      if (move != Coord::kInvalid) {
+        color_ = OtherColor(color_);
+      }
+      return move;
+    }
+
+    std::string Name() { return Send("name").value_or("<unknown>"); }
+
+   private:
+    absl::optional<std::string> Send(const std::string& msg) {
+      // std::cerr << "Sending '" << msg << "'" << std::endl;
+      MG_CHECK(fprintf(output_, "%s\n", msg.c_str()) > 0);
+      MG_CHECK(fflush(output_) == 0);
+
+      char buffer[100];
+      size_t length = sizeof(buffer);
+      char* ptr = buffer;
+
+      for (;;) {
+        std::string response(buffer, getline(&ptr, &length, input_));
+        if (response.empty()) {
+          continue;
+        }
+
+        auto result = response.front();
+        if (result == '?') {
+          return absl::nullopt;
+        }
+
+        if (result == '=') {
+          response.erase(response.begin());
+          absl::StripAsciiWhitespace(&response);
+          return response;
+        }
+      }
+    }
+
+    Color color_;
+    FILE* input_;
+    FILE* output_;
+  };
+
+ public:
+  void Run() {
+    auto start_time = absl::Now();
+
+    factory_ =
+        NewDualNetFactory(FLAGS_model, std::max(FLAGS_parallel_games / 2, 1));
+    std::cerr << "DualNet factory created from " << FLAGS_model << " in "
+              << absl::ToDoubleSeconds(absl::Now() - start_time) << " sec."
+              << std::endl;
+
+    ParseMctsPlayerOptionsFromFlags(&options_);
+    MG_CHECK(wordexp(FLAGS_gtp_client.c_str(), &cmd_words_, 0) == 0);
+
+    EvalResults mcts_results(file::Stem(FLAGS_model));
+    EvalResults gtp_results("");
+
+    auto* black_results = &mcts_results;
+    auto* white_results = &gtp_results;
+
+    std::vector<std::thread> threads;
+    for (int thread_id = 0; thread_id < FLAGS_parallel_games; ++thread_id) {
+      threads.emplace_back(std::bind(&GtpEvaluator::ThreadRun, this, thread_id,
+                                     black_results, white_results,
+                                     &gtp_results == black_results));
+      std::swap(black_results, white_results);
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+
+    wordfree(&cmd_words_);
+
+    std::cerr << "Evaluated " << FLAGS_parallel_games << " games, total time "
+              << absl::ToDoubleSeconds(absl::Now() - start_time) << " sec."
+              << std::endl;
+
+    LogEvalResults(FLAGS_parallel_games, gtp_results, mcts_results);
+  }
+
+ private:
+  void ThreadRun(int thread_id, EvalResults* black_results,
+                 EvalResults* white_results, bool gtp_is_black) {
+    auto player_options = options_;
+    player_options.verbose = thread_id == 0;
+    // If an random seed was explicitly specified, make sure we use a
+    // different seed for each thread.
+    if (player_options.random_seed != 0) {
+      player_options.random_seed += 1299283 * thread_id;
+    }
+
+    auto mcts_player =
+        absl::make_unique<MctsPlayer>(factory_->New(), player_options);
+    auto gtp_client =
+        absl::make_unique<GtpClient>(cmd_words_.we_wordv, options_.komi);
+
+    if (thread_id == 0) {
+      MG_CHECK(!gtp_is_black);
+      white_results->name = gtp_client->Name();
+    }
+
+    if (gtp_is_black) {
+      mcts_player->PlayMove(gtp_client->GenMove());
+    }
+
+    while (!mcts_player->root()->game_over()) {
+      auto move = mcts_player->SuggestMove();
+      if (!gtp_client->Play(move)) {
+        move = Coord::kResign;
+      }
+      mcts_player->PlayMove(move);
+      if (mcts_player->root()->game_over()) {
+        break;
+      }
+      mcts_player->PlayMove(gtp_client->GenMove());
+    }
+
+    if (mcts_player->result() > 0) {
+      ++black_results->black_wins;
+    }
+    if (mcts_player->result() < 0) {
+      ++white_results->white_wins;
+    }
+
+    // Write SGF.
+    if (!FLAGS_sgf_dir.empty()) {
+      std::string output_name =
+          absl::StrCat(GetOutputName(absl::Now(), thread_id), "-",
+                       black_results->name, "-", white_results->name);
+      WriteSgf(FLAGS_sgf_dir, output_name, *mcts_player, black_results->name,
+               *mcts_player, white_results->name, true);
+    }
+  }
+
+  MctsPlayer::Options options_;
+  std::unique_ptr<DualNetFactory> factory_;
+  wordexp_t cmd_words_;
+};
+
 void SelfPlay() {
   SelfPlayer player;
   player.Run();
 }
 
 void Eval() {
-  Evaluator evaluator;
-  evaluator.Run();
+  MG_CHECK(FLAGS_model_two.empty() ^ FLAGS_gtp_client.empty())
+      << "In 'eval' mode, please specify exactly one of 'model_two' and "
+         "'gtp_client'.";
+  if (FLAGS_model_two.empty()) {
+    GtpEvaluator evaluator;
+    evaluator.Run();
+  } else {
+    PairEvaluator evaluator;
+    evaluator.Run();
+  }
 }
 
 void Gtp() {
