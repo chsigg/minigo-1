@@ -427,7 +427,7 @@ class SelfPlayer {
       // Play the game.
       auto start_time = absl::Now();
       while (!player->root()->game_over()) {
-        auto move = player->SuggestMove();
+        auto c = player->SuggestMove();
         if (player->options().verbose) {
           const auto& position = player->root()->position;
           std::cerr << player->root()->position.ToPrettyString(use_ansi_colors);
@@ -436,7 +436,7 @@ class SelfPlayer {
                     << " O: " << position.num_captures()[1] << std::endl;
           std::cerr << player->root()->Describe() << std::endl;
         }
-        player->PlayMove(move);
+        player->PlayMove(c);
       }
 
       {
@@ -684,13 +684,13 @@ class PairEvaluator {
       // threads from flushing the batching queue prematurely. It actually
       // forces all players to move in lock-step to achieve optimal batching.
       barrier_->Wait();
-      auto move = player->SuggestMove();
+      auto c = player->SuggestMove();
       dual_net.reset();
       if (player->options().verbose) {
         std::cerr << player->root()->Describe() << "\n";
       }
-      player->PlayMove(move);
-      other_player->PlayMove(move);
+      player->PlayMove(c);
+      other_player->PlayMove(c);
       if (player->options().verbose) {
         std::cerr << player->root()->position.ToPrettyString();
       }
@@ -732,7 +732,7 @@ class PairEvaluator {
 class GtpEvaluator {
   class GtpClient {
    public:
-    GtpClient(char* const cmd_args[], float komi) : color_(Color::kBlack) {
+    GtpClient(char* const cmd_args[], float komi) : to_play_(Color::kBlack) {
       int in_pipe[2];   // minigo <- gnugo pipe
       int out_pipe[2];  // minigo -> gnugo pipe
 
@@ -770,27 +770,27 @@ class GtpEvaluator {
       fclose(output_);
     }
 
-    bool Play(const Coord& move) {
+    bool Play(const Coord& c) {
       std::ostringstream oss;
-      oss << "play " << color_ << " " << move.ToKgs();
+      oss << "play " << to_play_ << " " << c;
       bool success = Send(oss.str()).has_value();
       if (success) {
-        color_ = OtherColor(color_);
+        to_play_ = OtherColor(to_play_);
       }
       return success;
     }
 
     Coord GenMove() {
       std::ostringstream oss;
-      oss << "genmove " << color_;
-      auto move = Coord::kInvalid;
+      oss << "genmove " << to_play_;
+      auto c = Coord::kInvalid;
       if (auto response = Send(oss.str())) {
-        move = Coord::FromKgs(response.value(), true);
+        c = Coord::FromKgs(response.value(), true);
       }
-      if (move != Coord::kInvalid) {
-        color_ = OtherColor(color_);
+      if (c != Coord::kInvalid) {
+        to_play_ = OtherColor(to_play_);
       }
-      return move;
+      return c;
     }
 
     std::string Name() { return Send("name").value_or("<unknown>"); }
@@ -824,7 +824,7 @@ class GtpEvaluator {
       }
     }
 
-    Color color_;
+    Color to_play_;
     FILE* input_;
     FILE* output_;
   };
@@ -894,11 +894,11 @@ class GtpEvaluator {
     }
 
     while (!mcts_player->root()->game_over()) {
-      auto move = mcts_player->SuggestMove();
-      if (!gtp_client->Play(move)) {
-        move = Coord::kResign;
+      auto c = mcts_player->SuggestMove();
+      if (!gtp_client->Play(c)) {
+        c = Coord::kResign;
       }
-      mcts_player->PlayMove(move);
+      mcts_player->PlayMove(c);
       if (mcts_player->root()->game_over()) {
         break;
       }
@@ -933,7 +933,7 @@ void SelfPlay() {
 }
 
 void Eval() {
-  MG_CHECK(FLAGS_model_two.empty() ^ FLAGS_gtp_client.empty())
+  MG_CHECK(FLAGS_model_two.empty() != FLAGS_gtp_client.empty())
       << "In 'eval' mode, please specify exactly one of 'model_two' and "
          "'gtp_client'.";
   if (FLAGS_model_two.empty()) {
